@@ -3,6 +3,8 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
 use std::process::{Command, Output};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
@@ -355,6 +357,118 @@ fn managed_children_force_profile_scoped_secure_storage() {
             format!("{expected}|{expected}|auth logout"),
         ]
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn concurrent_case_variant_adds_start_only_one_login() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let fake_claude = temp.path().join("real-claude");
+    let login_calls = temp.path().join("login-calls.log");
+    let first_login_started = temp.path().join("first-login-started");
+    let release_login = temp.path().join("release-login");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+
+    fs::write(
+        &fake_claude,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2\" = \"auth login\" ]; then\n\
+               printf '%s\\n' \"$CLAUDE_CONFIG_DIR\" >> '{}'\n\
+               : > '{}'\n\
+               while [ ! -e '{}' ]; do sleep 0.01; done\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               printf '{{\"loggedIn\":true}}\\n'\n\
+             fi\n\
+             exit 0\n",
+            login_calls.display(),
+            first_login_started.display(),
+            release_login.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+    run(
+        binary,
+        &account_home,
+        &["install", "--real", fake_claude.to_str().unwrap()],
+    );
+
+    let first = Command::new(binary)
+        .env("CLAUDE_ACCOUNT_HOME", &account_home)
+        .env("ANTHROPIC_API_KEY", "must-not-leak")
+        .args(["account", "add", "Work"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(2), || first_login_started.exists()),
+        "first add did not reach auth login"
+    );
+
+    let second = Command::new(binary)
+        .env("CLAUDE_ACCOUNT_HOME", &account_home)
+        .env("ANTHROPIC_API_KEY", "must-not-leak")
+        .args(["account", "add", "work"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second_reached_login = wait_until(Duration::from_secs(2), || {
+        fs::read_to_string(&login_calls)
+            .map(|calls| calls.lines().count() > 1)
+            .unwrap_or(false)
+    });
+
+    fs::write(&release_login, b"release\n").unwrap();
+    let first_output = first.wait_with_output().unwrap();
+    let second_output = second.wait_with_output().unwrap();
+
+    assert!(
+        !second_reached_login,
+        "both case-variant adds reached auth login before the first registered:\n{}",
+        fs::read_to_string(&login_calls).unwrap()
+    );
+    let logged_logins = fs::read_to_string(&login_calls).unwrap();
+    assert_eq!(
+        logged_logins.lines().collect::<Vec<_>>(),
+        vec![account_home.join("profiles/Work").to_str().unwrap()]
+    );
+    assert!(
+        first_output.status.success(),
+        "first add failed: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(!second_output.status.success());
+    let second_error = String::from_utf8(second_output.stderr).unwrap();
+    assert!(
+        second_error.contains("differs only by letter case"),
+        "{second_error}"
+    );
+
+    let profiles = run(binary, &account_home, &["account", "list"]);
+    assert_eq!(String::from_utf8(profiles.stdout).unwrap().trim(), "* Work");
+}
+
+#[cfg(target_os = "macos")]
+fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if predicate() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    predicate()
 }
 
 #[cfg(target_os = "macos")]
