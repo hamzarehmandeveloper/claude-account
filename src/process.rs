@@ -1,10 +1,18 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+#[cfg(target_os = "macos")]
+use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::process::{Output, Stdio};
+#[cfg(target_os = "macos")]
+use std::thread::{self, JoinHandle};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -18,6 +26,10 @@ const AUTH_ENVIRONMENT: [&str; 3] = [
 ];
 #[cfg(target_os = "macos")]
 const MINIMUM_MACOS_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 144);
+#[cfg(target_os = "macos")]
+const MACOS_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "macos")]
+const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<()> {
     let state = state::load(paths)?;
@@ -45,6 +57,8 @@ pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<(
 pub fn managed_command(real_claude: &Path, config_dir: &Path) -> Command {
     let mut command = command_without_auth_environment(real_claude);
     command.env("CLAUDE_CONFIG_DIR", config_dir);
+    #[cfg(target_os = "macos")]
+    command.env("CLAUDE_SECURESTORAGE_CONFIG_DIR", config_dir);
 
     command
 }
@@ -62,15 +76,7 @@ fn command_without_auth_environment(program: &Path) -> Command {
 pub fn validate_platform_support(real_claude: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let output = command_without_auth_environment(real_claude)
-            .arg("--version")
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to query Claude Code version from {}",
-                    real_claude.display()
-                )
-            })?;
+        let output = query_claude_version(real_claude)?;
         if !output.status.success() {
             bail!(
                 "failed to query Claude Code version from {}; macOS requires Claude Code 2.1.144 or later for isolated Keychain credentials",
@@ -104,6 +110,91 @@ pub fn validate_platform_support(real_claude: &Path) -> Result<()> {
     let _ = real_claude;
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn query_claude_version(real_claude: &Path) -> Result<Output> {
+    let mut command = command_without_auth_environment(real_claude);
+    command
+        .arg("--version")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to query Claude Code version from {}",
+            real_claude.display()
+        )
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("Claude Code version probe did not capture stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("Claude Code version probe did not capture stderr")?;
+    let stdout_reader = read_version_stream(stdout);
+    let stderr_reader = read_version_stream(stderr);
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child.try_wait().with_context(|| {
+            format!(
+                "failed while querying Claude Code version from {}",
+                real_claude.display()
+            )
+        })? {
+            return Ok(Output {
+                status,
+                stdout: collect_version_stream(stdout_reader, "stdout")?,
+                stderr: collect_version_stream(stderr_reader, "stderr")?,
+            });
+        }
+
+        if started.elapsed() >= MACOS_VERSION_PROBE_TIMEOUT {
+            child.kill().with_context(|| {
+                format!(
+                    "failed to terminate timed-out Claude Code version probe from {}",
+                    real_claude.display()
+                )
+            })?;
+            child.wait().with_context(|| {
+                format!(
+                    "failed to reap timed-out Claude Code version probe from {}",
+                    real_claude.display()
+                )
+            })?;
+            bail!(
+                "timed out querying Claude Code version from {}; macOS requires Claude Code 2.1.144 or later for isolated Keychain credentials",
+                real_claude.display()
+            );
+        }
+
+        thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn read_version_stream<R>(mut stream: R) -> JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut contents = Vec::new();
+        stream.read_to_end(&mut contents)?;
+        Ok(contents)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn collect_version_stream(
+    reader: JoinHandle<io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("Claude Code version probe {stream_name} reader panicked"))?
+        .with_context(|| format!("failed to read Claude Code version probe {stream_name}"))
 }
 
 #[cfg(any(target_os = "macos", test))]
