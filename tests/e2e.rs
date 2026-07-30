@@ -460,6 +460,133 @@ fn concurrent_case_variant_adds_start_only_one_login() {
 }
 
 #[cfg(target_os = "macos")]
+#[test]
+fn legacy_case_collision_fails_closed_until_explicit_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let fake_claude = temp.path().join("real-claude");
+    let calls = temp.path().join("calls.log");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+    let shim = seed_legacy_case_collision(&account_home, binary, &fake_claude, &calls, "work");
+    let preserved_data = account_home.join("profiles/Work/preserve-me");
+
+    for arguments in [
+        &["account", "list"][..],
+        &["account", "current"][..],
+        &["account", "use", "Work"][..],
+        &["account", "add", "personal"][..],
+        &["account", "remove", "work", "--force"][..],
+        &["forwarded", "command"][..],
+    ] {
+        let output = invoke(&shim, &account_home, arguments, &[]);
+        assert!(
+            !output.status.success(),
+            "case-colliding state unexpectedly allowed: {}",
+            arguments.join(" ")
+        );
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains("claude account resolve-case-collision"),
+            "{error}"
+        );
+    }
+    assert!(!account_home.join("profiles/personal").exists());
+    assert!(!calls.exists(), "normal commands invoked fake Claude");
+
+    let recovery = run(
+        &shim,
+        &account_home,
+        &["account", "resolve-case-collision", "work"],
+    );
+    let recovery_output = String::from_utf8(recovery.stdout).unwrap();
+    assert!(
+        recovery_output.contains("Local data and credentials were preserved"),
+        "{recovery_output}"
+    );
+    assert!(
+        recovery_output.contains("`Work` remains registered"),
+        "{recovery_output}"
+    );
+    assert!(
+        recovery_output.contains("claude account use Work"),
+        "{recovery_output}"
+    );
+    assert_eq!(fs::read_to_string(&preserved_data).unwrap(), "keep\n");
+    assert!(!calls.exists(), "recovery invoked fake Claude");
+
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
+    assert!(state["profiles"].get("work").is_none());
+    assert!(state["profiles"].get("Work").is_some());
+    assert!(state["active"].is_null());
+
+    let profiles = run(&shim, &account_home, &["account", "list"]);
+    assert_eq!(String::from_utf8(profiles.stdout).unwrap(), "  Work\n");
+    run(&shim, &account_home, &["account", "use", "Work"]);
+    let current = run(&shim, &account_home, &["account", "current"]);
+    assert_eq!(String::from_utf8(current.stdout).unwrap().trim(), "Work");
+    assert!(
+        !calls.exists(),
+        "post-recovery state access invoked fake Claude"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn resolve_case_collision_preserves_a_different_active_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let fake_claude = temp.path().join("real-claude");
+    let calls = temp.path().join("calls.log");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+    seed_legacy_case_collision(&account_home, binary, &fake_claude, &calls, "Work");
+
+    let recovery = run(binary, &account_home, &["resolve-case-collision", "work"]);
+
+    let output = String::from_utf8(recovery.stdout).unwrap();
+    assert!(output.contains("`Work` remains active"), "{output}");
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["active"], "Work");
+    assert!(state["profiles"].get("work").is_none());
+    assert!(state["profiles"].get("Work").is_some());
+    assert!(!calls.exists(), "recovery invoked fake Claude");
+    assert_eq!(
+        fs::read_to_string(account_home.join("profiles/Work/preserve-me")).unwrap(),
+        "keep\n"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn resolve_case_collision_refuses_a_non_colliding_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let fake_claude = temp.path().join("real-claude");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+    seed_installed_profile(&account_home, binary, &fake_claude, "work");
+
+    let output = invoke(
+        binary,
+        &account_home,
+        &["resolve-case-collision", "work"],
+        &[],
+    );
+
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("does not have a case-colliding sibling"),
+        "{error}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
+    assert!(state["profiles"].get("work").is_some());
+    assert_eq!(state["active"], "work");
+    assert!(account_home.join("profiles/work").is_dir());
+}
+
+#[cfg(target_os = "macos")]
 fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -496,6 +623,53 @@ fn seed_installed_profile(
         "active": profile_name,
         "real_claude": fake_claude,
         "profiles": profiles
+    });
+    fs::write(
+        account_home.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    shim
+}
+
+#[cfg(target_os = "macos")]
+fn seed_legacy_case_collision(
+    account_home: &Path,
+    binary: &Path,
+    fake_claude: &Path,
+    calls: &Path,
+    active_profile: &str,
+) -> std::path::PathBuf {
+    let shim = account_home.join("bin/claude");
+    let work_upper = account_home.join("profiles/Work");
+    let work_lower = account_home.join("profiles/work");
+    fs::create_dir_all(shim.parent().unwrap()).unwrap();
+    fs::create_dir_all(&work_upper).unwrap();
+    fs::write(work_upper.join("preserve-me"), "keep\n").unwrap();
+    symlink(binary, &shim).unwrap();
+    fs::write(
+        fake_claude,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 89\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+    let state = serde_json::json!({
+        "version": 1,
+        "active": active_profile,
+        "real_claude": fake_claude,
+        "profiles": {
+            "Work": {
+                "config_dir": work_upper,
+                "created_at": 0
+            },
+            "work": {
+                "config_dir": work_lower,
+                "created_at": 0
+            }
+        }
     });
     fs::write(
         account_home.join("state.json"),

@@ -116,6 +116,22 @@ On macOS, profile names must also be unique when compared without ASCII letter
 case, preventing two names from sharing one directory on common
 case-insensitive filesystems.
 
+If a state file created on a case-sensitive system already contains variants
+such as `Work` and `work`, normal commands fail closed on macOS. Choose the
+exact spelling to unregister and run the explicit recovery command:
+
+```bash
+claude account resolve-case-collision work
+# Or invoke the manager directly:
+claude-account resolve-case-collision work
+```
+
+This only unregisters that exact name from the state file. It does not run
+Claude Code, log out, delete or rename either profile directory, or touch
+Keychain credentials. The command names the surviving profile and, when the
+removed name was active, the `claude account use NAME` step that completes
+recovery. It refuses profiles that do not have a case-colliding sibling.
+
 ### Switch accounts
 
 ```bash

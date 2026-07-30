@@ -48,6 +48,11 @@ enum AccountCommand {
     List,
     /// Print only the active profile name
     Current,
+    /// Safely unregister one exact name from legacy case-colliding state
+    ResolveCaseCollision {
+        /// Exact profile name to unregister
+        name: String,
+    },
     /// Log out and unregister a profile
     Remove {
         name: String,
@@ -81,6 +86,7 @@ impl AccountCli {
             AccountCommand::Use { name } => use_profile(paths, &name),
             AccountCommand::List => list(paths),
             AccountCommand::Current => current(paths),
+            AccountCommand::ResolveCaseCollision { name } => resolve_case_collision(paths, &name),
             AccountCommand::Remove {
                 name,
                 purge,
@@ -255,6 +261,59 @@ fn current(paths: &AppPaths) -> Result<()> {
         }
         None => bail!("no active profile"),
     }
+}
+
+fn resolve_case_collision(paths: &AppPaths, name: &str) -> Result<()> {
+    validate_profile_name(name)?;
+    let _lock = StateLock::acquire(paths)?;
+    let mut state = state::load_for_case_collision_resolution(paths)?;
+    let profile = state
+        .profiles
+        .get(name)
+        .cloned()
+        .with_context(|| format!("profile `{name}` does not exist"))?;
+    state
+        .case_colliding_profile_name(name)
+        .with_context(|| format!("profile `{name}` does not have a case-colliding sibling"))?;
+
+    state.profiles.remove(name);
+    let removed_was_active = state.active.as_deref() == Some(name);
+    if removed_was_active {
+        state.active = None;
+    }
+    let remaining_case_variants: Vec<String> = state
+        .profiles
+        .keys()
+        .filter(|existing| existing.eq_ignore_ascii_case(name))
+        .cloned()
+        .collect();
+    state::save(paths, &state)?;
+
+    println!("Unregistered exact profile name `{name}` from account state.");
+    println!(
+        "Local data and credentials were preserved; Claude logout was not run and {} was not deleted.",
+        profile.config_dir.display()
+    );
+    if let [survivor] = remaining_case_variants.as_slice() {
+        println!("`{survivor}` remains registered.");
+        if removed_was_active {
+            println!(
+                "Finish recovery with `claude account use {survivor}` if it should be active."
+            );
+        } else if state.active.as_deref() == Some(survivor.as_str()) {
+            println!("`{survivor}` remains active; normal commands can resume.");
+        } else {
+            println!(
+                "Normal commands can resume. Run `claude account use {survivor}` to activate the surviving profile."
+            );
+        }
+    } else {
+        let next = &remaining_case_variants[0];
+        println!(
+            "Case-colliding profiles still remain. Run `claude account resolve-case-collision {next}` again, leaving exactly one spelling registered."
+        );
+    }
+    Ok(())
 }
 
 fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> {

@@ -65,6 +65,12 @@ pub struct StateLock {
     _file: File,
 }
 
+#[derive(Clone, Copy)]
+enum CaseCollisionValidation {
+    Enforce,
+    AllowForExplicitResolution,
+}
+
 impl StateLock {
     pub fn acquire(paths: &AppPaths) -> Result<Self> {
         ensure_private_dir(&paths.config_dir)?;
@@ -93,6 +99,18 @@ impl StateLock {
 }
 
 pub fn load(paths: &AppPaths) -> Result<State> {
+    load_with_case_collision_validation(paths, CaseCollisionValidation::Enforce)
+}
+
+/// Load version-checked state while bypassing only the macOS case-collision check.
+pub fn load_for_case_collision_resolution(paths: &AppPaths) -> Result<State> {
+    load_with_case_collision_validation(paths, CaseCollisionValidation::AllowForExplicitResolution)
+}
+
+fn load_with_case_collision_validation(
+    paths: &AppPaths,
+    collision_validation: CaseCollisionValidation,
+) -> Result<State> {
     let state = match File::open(&paths.state_file) {
         Ok(file) => {
             let state: State = serde_json::from_reader(file)
@@ -111,24 +129,29 @@ pub fn load(paths: &AppPaths) -> Result<State> {
                 .with_context(|| format!("failed to read {}", paths.state_file.display()));
         }
     };
-    validate_platform_state(&state)?;
+    validate_platform_state(&state, collision_validation)?;
     Ok(state)
 }
 
-fn validate_platform_state(state: &State) -> Result<()> {
+fn validate_platform_state(
+    state: &State,
+    collision_validation: CaseCollisionValidation,
+) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        for name in state.profiles.keys() {
-            if let Some(existing) = state.case_colliding_profile_name(name) {
-                anyhow::bail!(
-                    "profiles `{name}` and `{existing}` differ only by letter case; macOS profile names must be unique ignoring ASCII case"
-                );
+        if matches!(collision_validation, CaseCollisionValidation::Enforce) {
+            for name in state.profiles.keys() {
+                if let Some(existing) = state.case_colliding_profile_name(name) {
+                    anyhow::bail!(
+                        "profiles `{name}` and `{existing}` differ only by letter case; macOS profile names must be unique ignoring ASCII case; run `claude account resolve-case-collision {name}` to unregister exactly `{name}` without deleting local data or credentials"
+                    );
+                }
             }
         }
     }
 
     #[cfg(not(target_os = "macos"))]
-    let _ = state;
+    let _ = (state, collision_validation);
 
     Ok(())
 }
@@ -230,5 +253,33 @@ mod tests {
         let error = load(&paths).unwrap_err();
 
         assert!(error.to_string().contains("differ only by letter case"));
+    }
+
+    #[test]
+    fn collision_resolution_load_still_rejects_unsupported_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let _lock = StateLock::acquire(&paths).unwrap();
+        fs::write(
+            &paths.state_file,
+            r#"{"version":2,"active":null,"real_claude":null,"profiles":{}}"#,
+        )
+        .unwrap();
+
+        let error = load_for_case_collision_resolution(&paths).unwrap_err();
+
+        assert!(error.to_string().contains("unsupported state version 2"));
+    }
+
+    #[test]
+    fn collision_resolution_load_still_rejects_malformed_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let _lock = StateLock::acquire(&paths).unwrap();
+        fs::write(&paths.state_file, b"not json\n").unwrap();
+
+        let error = load_for_case_collision_resolution(&paths).unwrap_err();
+
+        assert!(error.to_string().contains("failed to parse"));
     }
 }
