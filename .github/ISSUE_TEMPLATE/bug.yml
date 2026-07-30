@@ -25,10 +25,10 @@ body:
       required: true
 
   - type: input
-    id: distribution
+    id: operating_system
     attributes:
-      label: Linux distribution
-      placeholder: "Ubuntu 24.04"
+      label: Operating system and version
+      placeholder: "macOS 15.5 or Ubuntu 24.04"
     validations:
       required: true
 

@@ -14,9 +14,11 @@ Thank you for helping improve claude-account.
 
 Requirements:
 
-- Linux
+- Linux or macOS
 - Rust 1.85 or newer
-- Claude Code only when manually testing real authentication
+- Xcode Command Line Tools when building on macOS
+- Claude Code only when manually testing real authentication; version 2.1.144
+  or newer is required on macOS
 
 Run the local checks:
 

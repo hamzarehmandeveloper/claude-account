@@ -13,7 +13,7 @@ deletion vulnerability.
 
 Include:
 
-- The affected version and Linux distribution
+- The affected version, operating system, and OS version
 - Reproduction steps using placeholder credentials
 - The expected and observed behavior
 - Any proposed fix, if available
@@ -25,9 +25,14 @@ or the contents of `.credentials.json`.
 
 claude-account does not parse or copy Claude credentials. It creates an
 isolated `CLAUDE_CONFIG_DIR` and delegates authentication to the official
-Claude Code executable. Local profile directories are owner-only (`0700`) and
-the registry is owner-readable and owner-writable (`0600`).
+Claude Code executable. On macOS, Claude Code 2.1.144 or later stores each
+profile's credentials in a `CLAUDE_CONFIG_DIR`-scoped Keychain entry, and
+claude-account rejects older versions before login, launch, or logout. Local
+profile directories are owner-only (`0700`) and the registry is owner-readable
+and owner-writable (`0600`).
 
 The program runs with the invoking user's permissions. Anyone who can modify
 that user's configuration or executable search path is already within the same
-local trust boundary.
+local trust boundary. A custom `CLAUDE_ACCOUNT_HOME` should point to a private
+local directory; filesystem ACLs or network-share permissions can grant access
+that POSIX `0600` and `0700` mode bits alone do not remove.

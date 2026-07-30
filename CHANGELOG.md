@@ -7,6 +7,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+### Added
+
+- macOS account isolation with a Claude Code 2.1.144 minimum-version guard for
+  profile-scoped Keychain credentials.
+- Native CI and release archives for Apple Silicon and Intel macOS.
+
+### Changed
+
+- Reject macOS profile names that differ only by ASCII letter case to prevent
+  collisions on case-insensitive filesystems.
+- Print shell startup guidance for both zsh and Bash.
+
 ## [0.1.1] - 2026-07-30
 
 ### Fixed

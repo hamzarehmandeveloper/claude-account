@@ -6,12 +6,31 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Build Linux release
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.name }} release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            macos_deployment_target: ""
+          - name: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            macos_deployment_target: "11.0"
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            macos_deployment_target: "10.15"
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -20,30 +39,57 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.85.1
+          targets: ${{ matrix.target }}
 
       - name: Test
         run: cargo test --locked --all-targets
 
       - name: Build
-        run: cargo build --locked --release
+        run: cargo build --locked --release --target "$TARGET"
 
       - name: Package
         env:
           VERSION: ${{ github.ref_name }}
         run: |
-          archive="claude-account-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          archive="claude-account-${VERSION}-${TARGET}.tar.gz"
           mkdir staging
-          cp target/release/claude-account README.md LICENSE staging/
+          cp "target/${TARGET}/release/claude-account" README.md LICENSE staging/
           tar -C staging -czf "${archive}" .
-          sha256sum "${archive}" > "${archive}.sha256"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${archive}" > "${archive}.sha256"
+          else
+            shasum -a 256 "${archive}" > "${archive}.sha256"
+          fi
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            claude-account-*.tar.gz
+            claude-account-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           VERSION: ${{ github.ref_name }}
         run: |
           gh release create "${VERSION}" \
-            claude-account-"${VERSION}"-x86_64-unknown-linux-gnu.tar.gz \
-            claude-account-"${VERSION}"-x86_64-unknown-linux-gnu.tar.gz.sha256 \
+            dist/* \
             --generate-notes \
             --title "${VERSION}"
