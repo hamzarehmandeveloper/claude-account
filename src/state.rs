@@ -84,23 +84,45 @@ impl StateLock {
 }
 
 pub fn load(paths: &AppPaths) -> Result<State> {
-    match File::open(&paths.state_file) {
+    let state = match File::open(&paths.state_file) {
         Ok(file) => {
             let state: State = serde_json::from_reader(file)
                 .with_context(|| format!("failed to parse {}", paths.state_file.display()))?;
             if state.version != 1 {
                 anyhow::bail!("unsupported state version {}", state.version);
             }
-            Ok(state)
+            state
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(State {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => State {
             version: state_version(),
             ..State::default()
-        }),
+        },
         Err(error) => {
-            Err(error).with_context(|| format!("failed to read {}", paths.state_file.display()))
+            return Err(error)
+                .with_context(|| format!("failed to read {}", paths.state_file.display()));
+        }
+    };
+    validate_platform_state(&state)?;
+    Ok(state)
+}
+
+fn validate_platform_state(state: &State) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut folded_names = BTreeMap::new();
+        for name in state.profiles.keys() {
+            if let Some(existing) = folded_names.insert(name.to_ascii_lowercase(), name) {
+                anyhow::bail!(
+                    "profiles `{existing}` and `{name}` differ only by letter case; macOS profile names must be unique ignoring ASCII case"
+                );
+            }
         }
     }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = state;
+
+    Ok(())
 }
 
 pub fn save(paths: &AppPaths, state: &State) -> Result<()> {
@@ -178,5 +200,27 @@ mod tests {
 
         assert_eq!(loaded.active.as_deref(), Some("work"));
         assert!(loaded.profiles.contains_key("work"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn load_rejects_case_colliding_profile_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let mut state = State {
+            version: 1,
+            ..State::default()
+        };
+        state
+            .profiles
+            .insert("work".to_owned(), Profile::new(paths.profile_dir("work")));
+        state
+            .profiles
+            .insert("Work".to_owned(), Profile::new(paths.profile_dir("Work")));
+
+        save(&paths, &state).unwrap();
+        let error = load(&paths).unwrap_err();
+
+        assert!(error.to_string().contains("differ only by letter case"));
     }
 }

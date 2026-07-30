@@ -19,7 +19,7 @@ use crate::state::{self, Profile, StateLock};
 #[command(
     name = "claude account",
     version,
-    about = "Manage isolated Claude Code accounts on Linux"
+    about = "Manage isolated Claude Code accounts on Linux and macOS"
 )]
 pub struct AccountCli {
     #[command(subcommand)]
@@ -101,6 +101,7 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         if state.profiles.contains_key(name) {
             bail!("profile `{name}` already exists");
         }
+        validate_new_profile_name(&state, name)?;
         state
     };
 
@@ -109,6 +110,7 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         &current_executable,
         paths,
     )?;
+    process::validate_platform_support(&real_claude)?;
     let profile_dir = paths.profile_dir(name);
     state::ensure_private_dir(&profile_dir)?;
 
@@ -155,6 +157,7 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         if state.profiles.contains_key(name) {
             bail!("profile `{name}` was added by another process");
         }
+        validate_new_profile_name(&state, name)?;
         first_profile = state.profiles.is_empty();
         state.real_claude = Some(real_claude);
         state
@@ -290,6 +293,7 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> 
         (profile, real_claude, is_active)
     };
 
+    process::validate_platform_support(&real_claude)?;
     println!("Logging out profile `{name}`...");
     let logout_status = process::managed_command(&real_claude, &profile.config_dir)
         .args(["auth", "logout"])
@@ -351,6 +355,7 @@ fn install(paths: &AppPaths, explicit_real: Option<&Path>) -> Result<()> {
         }
         None => process::resolve_real_claude(configured.as_deref(), &current_executable, paths)?,
     };
+    process::validate_platform_support(&real_claude)?;
 
     state::ensure_private_dir(&paths.data_dir)?;
     state::ensure_private_dir(&paths.shim_dir)?;
@@ -414,8 +419,28 @@ fn install(paths: &AppPaths, explicit_real: Option<&Path>) -> Result<()> {
     println!("Real Claude: {}", real_claude.display());
     println!("Shim: {}", paths.shim.display());
     println!();
-    println!("Add this line to ~/.bashrc, then open a new terminal:");
+    println!(
+        "Add this line to your shell startup file (for example, ~/.zshrc or ~/.bashrc), then open a new terminal:"
+    );
     println!("export PATH=\"{}:$PATH\"", paths.shim_dir.display());
+    Ok(())
+}
+
+fn validate_new_profile_name(state: &state::State, name: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(existing) = state
+        .profiles
+        .keys()
+        .find(|existing| existing.eq_ignore_ascii_case(name))
+    {
+        bail!(
+            "profile `{name}` differs only by letter case from existing profile `{existing}`; choose another name on macOS"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    let _ = (state, name);
+
     Ok(())
 }
 
@@ -460,6 +485,10 @@ mod tests {
         writeln!(
             script,
             "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
              printf '%s|%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" >> '{}'\n\
              if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
                printf '{{\"loggedIn\":true}}\\n'\n\
@@ -522,6 +551,10 @@ mod tests {
         fs::write(
             &fake_claude,
             "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
              if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
                printf '{\"loggedIn\":false}\\n'\n\
              fi\n\
@@ -541,5 +574,42 @@ mod tests {
         assert!(error.to_string().contains("did not report a valid login"));
         assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
         assert!(!paths.profile_dir("work").join(".claude.json").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn add_rejects_profile_name_that_differs_only_by_case() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        fs::write(
+            &fake_claude,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               printf '{\"loggedIn\":true}\\n'\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+        {
+            let _lock = StateLock::acquire(&paths).unwrap();
+            let mut initial = state::load(&paths).unwrap();
+            initial.real_claude = Some(fake_claude);
+            initial
+                .profiles
+                .insert("Work".to_owned(), Profile::new(paths.profile_dir("Work")));
+            initial.active = Some("Work".to_owned());
+            state::save(&paths, &initial).unwrap();
+        }
+
+        let error = add(&paths, "work", None, false, false).unwrap_err();
+        assert!(error.to_string().contains("differs only by letter case"));
+        assert_eq!(state::load(&paths).unwrap().profiles.len(), 1);
     }
 }

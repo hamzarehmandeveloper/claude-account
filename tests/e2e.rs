@@ -22,7 +22,7 @@ fn run(program: &Path, account_home: &Path, arguments: &[&str]) -> Output {
 }
 
 #[test]
-fn complete_linux_profile_lifecycle() {
+fn complete_profile_lifecycle() {
     let temp = tempfile::tempdir().unwrap();
     let account_home = temp.path().join("account-home");
     let fake_claude = temp.path().join("real-claude");
@@ -33,6 +33,10 @@ fn complete_linux_profile_lifecycle() {
         &fake_claude,
         format!(
             "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
              printf '%s|%s|%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_API_KEY\" \"$*\" >> '{}'\n\
              if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
                printf '{{\"loggedIn\":true}}\\n'\n\
@@ -46,11 +50,14 @@ fn complete_linux_profile_lifecycle() {
     .unwrap();
     fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
 
-    run(
+    let install = run(
         binary,
         &account_home,
         &["install", "--real", fake_claude.to_str().unwrap()],
     );
+    let install_output = String::from_utf8(install.stdout).unwrap();
+    assert!(install_output.contains("~/.zshrc"));
+    assert!(install_output.contains("~/.bashrc"));
     let shim = account_home.join("bin/claude");
     assert!(shim.is_symlink());
 
@@ -103,4 +110,45 @@ fn complete_linux_profile_lifecycle() {
         !logged_calls.contains("must-not-leak"),
         "auth environment variable leaked to Claude"
     );
+}
+
+#[test]
+fn help_names_supported_platforms() {
+    let temp = tempfile::tempdir().unwrap();
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+
+    let help = run(binary, temp.path(), &["--help"]);
+    let help = String::from_utf8(help.stdout).unwrap();
+
+    assert!(help.contains("Linux and macOS"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn install_rejects_claude_without_profile_scoped_keychain_support() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let fake_claude = temp.path().join("old-claude");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+
+    fs::write(
+        &fake_claude,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then\n\
+           printf '2.1.143 (Claude Code)\\n'\n\
+         fi\n\
+         exit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = Command::new(binary)
+        .env("CLAUDE_ACCOUNT_HOME", &account_home)
+        .args(["install", "--real", fake_claude.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("2.1.144 or later"), "{error}");
 }
