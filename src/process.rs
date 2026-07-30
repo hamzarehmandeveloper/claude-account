@@ -1,5 +1,7 @@
 use std::env;
 use std::ffi::OsString;
+#[cfg(any(target_os = "macos", test))]
+use std::fmt;
 use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::{self, Read};
@@ -24,7 +26,7 @@ const AUTH_ENVIRONMENT: [&str; 3] = [
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
 ];
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const MINIMUM_MACOS_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 144);
 #[cfg(target_os = "macos")]
 const MACOS_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -105,12 +107,9 @@ pub fn validate_platform_support(real_claude: &Path) -> Result<()> {
                 "could not parse Claude Code version from `{reported}`; macOS requires Claude Code 2.1.144 or later for isolated Keychain credentials"
             )
         })?;
-        if version < MINIMUM_MACOS_CLAUDE_VERSION {
+        if !version.supports_isolated_macos_keychain() {
             bail!(
-                "Claude Code 2.1.144 or later is required on macOS for isolated Keychain credentials; found {}.{}.{}; update Claude Code and retry",
-                version.0,
-                version.1,
-                version.2
+                "Claude Code 2.1.144 or later is required on macOS for isolated Keychain credentials; found {version}; update Claude Code and retry"
             );
         }
     }
@@ -309,14 +308,54 @@ fn collect_version_stream(
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn parse_claude_version(value: &str) -> Option<(u64, u64, u64)> {
+#[derive(Debug, Eq, PartialEq)]
+struct ClaudeVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    prerelease: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ClaudeVersion {
+    fn supports_isolated_macos_keychain(&self) -> bool {
+        let numeric_core = (self.major, self.minor, self.patch);
+        numeric_core > MINIMUM_MACOS_CLAUDE_VERSION
+            || (numeric_core == MINIMUM_MACOS_CLAUDE_VERSION && self.prerelease.is_none())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl fmt::Display for ClaudeVersion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)?;
+        if let Some(prerelease) = &self.prerelease {
+            write!(formatter, "-{prerelease}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_claude_version(value: &str) -> Option<ClaudeVersion> {
     value.split_whitespace().find_map(|word| {
-        let version = word.trim_start_matches('v').split('-').next()?;
-        let mut parts = version.split('.');
+        let version = word.strip_prefix('v').unwrap_or(word);
+        let version = version.split('+').next()?;
+        let (numeric_core, prerelease) = match version.split_once('-') {
+            Some((_numeric_core, "")) => return None,
+            Some((numeric_core, prerelease)) => (numeric_core, Some(prerelease.to_owned())),
+            None => (version, None),
+        };
+        let mut parts = numeric_core.split('.');
         let major = parts.next()?.parse().ok()?;
         let minor = parts.next()?.parse().ok()?;
         let patch = parts.next()?.parse().ok()?;
-        (parts.next().is_none()).then_some((major, minor, patch))
+        (parts.next().is_none()).then_some(ClaudeVersion {
+            major,
+            minor,
+            patch,
+            prerelease,
+        })
     })
 }
 
@@ -387,12 +426,45 @@ mod tests {
     fn parses_claude_code_version_output() {
         assert_eq!(
             parse_claude_version("2.1.144 (Claude Code)"),
-            Some((2, 1, 144))
+            Some(ClaudeVersion {
+                major: 2,
+                minor: 1,
+                patch: 144,
+                prerelease: None,
+            })
         );
         assert_eq!(
             parse_claude_version("v2.2.0-beta.1 (Claude Code)"),
-            Some((2, 2, 0))
+            Some(ClaudeVersion {
+                major: 2,
+                minor: 2,
+                patch: 0,
+                prerelease: Some("beta.1".to_owned()),
+            })
         );
         assert_eq!(parse_claude_version("Claude Code"), None);
+    }
+
+    #[test]
+    fn applies_semver_precedence_at_macos_minimum() {
+        let supports = |version| {
+            parse_claude_version(version)
+                .unwrap()
+                .supports_isolated_macos_keychain()
+        };
+
+        assert!(!supports("2.1.143"));
+        assert!(!supports("2.1.144-beta.1"));
+        assert!(supports("2.1.144"));
+        assert!(supports("2.1.144+build.1"));
+        assert!(supports("2.1.145-beta.1"));
+    }
+
+    #[test]
+    fn displays_prerelease_in_version_errors() {
+        assert_eq!(
+            parse_claude_version("2.1.144-beta.1").unwrap().to_string(),
+            "2.1.144-beta.1"
+        );
     }
 }
