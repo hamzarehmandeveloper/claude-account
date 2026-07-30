@@ -48,6 +48,15 @@ impl Profile {
     }
 }
 
+impl State {
+    pub fn case_colliding_profile_name(&self, candidate: &str) -> Option<&str> {
+        self.profiles.keys().find_map(|existing| {
+            let existing = existing.as_str();
+            (existing != candidate && existing.eq_ignore_ascii_case(candidate)).then_some(existing)
+        })
+    }
+}
+
 fn state_version() -> u32 {
     1
 }
@@ -109,11 +118,10 @@ pub fn load(paths: &AppPaths) -> Result<State> {
 fn validate_platform_state(state: &State) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let mut folded_names = BTreeMap::new();
         for name in state.profiles.keys() {
-            if let Some(existing) = folded_names.insert(name.to_ascii_lowercase(), name) {
+            if let Some(existing) = state.case_colliding_profile_name(name) {
                 anyhow::bail!(
-                    "profiles `{existing}` and `{name}` differ only by letter case; macOS profile names must be unique ignoring ASCII case"
+                    "profiles `{name}` and `{existing}` differ only by letter case; macOS profile names must be unique ignoring ASCII case"
                 );
             }
         }

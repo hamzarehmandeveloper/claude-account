@@ -428,11 +428,7 @@ fn install(paths: &AppPaths, explicit_real: Option<&Path>) -> Result<()> {
 
 fn validate_new_profile_name(state: &state::State, name: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
-    if let Some(existing) = state
-        .profiles
-        .keys()
-        .find(|existing| existing.eq_ignore_ascii_case(name))
-    {
+    if let Some(existing) = state.case_colliding_profile_name(name) {
         bail!(
             "profile `{name}` differs only by letter case from existing profile `{existing}`; choose another name on macOS"
         );
