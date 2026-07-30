@@ -487,7 +487,7 @@ fn concurrent_case_variant_adds_start_only_one_login() {
         "first add did not reach auth login"
     );
 
-    let reservation_file = account_home.join("add-reservations/work.lock");
+    let reservation_file = account_home.join("profile-reservations/work.lock");
     assert_exclusively_locked(&reservation_file);
 
     let second = Command::new(binary)
@@ -685,6 +685,120 @@ fn add_login_allows_unrelated_state_updates_and_merges_them() {
         final_state["real_claude"],
         serde_json::json!(replacement_claude)
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn remove_purge_serializes_case_variant_add_until_deletion_finishes() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let fake_claude = temp.path().join("real-claude");
+    let remove_started = temp.path().join("remove-started");
+    let release_remove = temp.path().join("release-remove");
+    let login_started = temp.path().join("login-started");
+    let events = temp.path().join("events.log");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+
+    fs::write(
+        &fake_claude,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2\" = \"auth logout\" ]; then\n\
+               printf 'logout\\n' >> '{}'\n\
+               : > '{}'\n\
+               attempts=0\n\
+               while [ ! -e '{}' ] && [ \"$attempts\" -lt 500 ]; do\n\
+                 attempts=$((attempts + 1))\n\
+                 sleep 0.01\n\
+               done\n\
+               [ -e '{}' ] || exit 70\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2\" = \"auth login\" ]; then\n\
+               printf 'login\\n' >> '{}'\n\
+               : > '{}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               printf '{{\"loggedIn\":true}}\\n'\n\
+             fi\n\
+             exit 0\n",
+            events.display(),
+            remove_started.display(),
+            release_remove.display(),
+            release_remove.display(),
+            events.display(),
+            login_started.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let shim = seed_installed_profile(&account_home, binary, &fake_claude, "Work");
+    let old_data = account_home.join("profiles/Work/old-data");
+    fs::write(&old_data, b"remove me\n").unwrap();
+
+    let removing = Command::new(&shim)
+        .env("CLAUDE_ACCOUNT_HOME", &account_home)
+        .args(["account", "remove", "Work", "--force", "--purge", "--yes"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let removing = ChildCleanupGuard::new(removing);
+    let mut remove_release = FileReleaseGuard::new(release_remove);
+    assert!(
+        wait_until(Duration::from_secs(2), || remove_started.exists()),
+        "remove did not reach logout"
+    );
+
+    let reservation_file = account_home.join("profile-reservations/work.lock");
+    assert_exclusively_locked(&reservation_file);
+
+    let adding = Command::new(&shim)
+        .env("CLAUDE_ACCOUNT_HOME", &account_home)
+        .args(["account", "add", "work"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut adding = ChildCleanupGuard::new(adding);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        adding.try_wait().unwrap().is_none(),
+        "case-variant add did not wait for removal"
+    );
+    assert!(
+        !login_started.exists(),
+        "case-variant add reached login before removal finished"
+    );
+
+    remove_release.release();
+    let remove_output = removing.wait_with_output_bounded(Duration::from_secs(3));
+    assert!(
+        remove_output.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&remove_output.stderr)
+    );
+    let add_output = adding.wait_with_output_bounded(Duration::from_secs(3));
+    assert!(
+        add_output.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    assert_eq!(fs::read_to_string(&events).unwrap(), "logout\nlogin\n");
+    assert!(!old_data.exists(), "purge left old profile data behind");
+    assert!(login_started.exists());
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["active"], "work");
+    assert!(state["profiles"].get("Work").is_none());
+    assert!(state["profiles"].get("work").is_some());
 }
 
 #[cfg(target_os = "macos")]

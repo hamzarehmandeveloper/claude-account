@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::paths::AppPaths;
 use crate::process;
-use crate::state::{self, AddReservation, Profile, StateLock};
+use crate::state::{self, Profile, ProfileReservation, StateLock};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -100,7 +100,7 @@ impl AccountCli {
 
 fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bool) -> Result<()> {
     validate_profile_name(name)?;
-    let _add_reservation = AddReservation::acquire(paths, name)?;
+    let _profile_reservation = ProfileReservation::acquire(paths, name)?;
     let current_executable = env::current_exe().context("failed to locate this executable")?;
     let initial_real_claude = {
         let _state_lock = StateLock::acquire(paths)?;
@@ -279,6 +279,7 @@ fn current(paths: &AppPaths) -> Result<()> {
 
 fn resolve_case_collision(paths: &AppPaths, name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    let _profile_reservation = ProfileReservation::acquire(paths, name)?;
     let _lock = StateLock::acquire(paths)?;
     let mut state = state::load_for_case_collision_resolution(paths)?;
     let profile = state
@@ -332,6 +333,7 @@ fn resolve_case_collision(paths: &AppPaths, name: &str) -> Result<()> {
 
 fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> {
     validate_profile_name(name)?;
+    let _profile_reservation = ProfileReservation::acquire(paths, name)?;
     let (profile, real_claude, is_active) = {
         let _lock = StateLock::acquire(paths)?;
         let state = state::load(paths)?;

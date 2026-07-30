@@ -9,7 +9,7 @@ pub struct AppPaths {
     pub data_dir: PathBuf,
     pub state_file: PathBuf,
     pub lock_file: PathBuf,
-    pub add_reservations_dir: PathBuf,
+    pub profile_reservations_dir: PathBuf,
     pub profiles_dir: PathBuf,
     pub shim_dir: PathBuf,
     pub shim: PathBuf,
@@ -48,7 +48,7 @@ impl AppPaths {
         Self {
             state_file: config_dir.join("state.json"),
             lock_file: config_dir.join("state.lock"),
-            add_reservations_dir: config_dir.join("add-reservations"),
+            profile_reservations_dir: config_dir.join("profile-reservations"),
             profiles_dir: data_dir.join("profiles"),
             shim: shim_dir.join("claude"),
             installed_executable: data_dir.join("libexec/claude-account"),

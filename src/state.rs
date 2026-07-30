@@ -65,7 +65,7 @@ pub struct StateLock {
     _file: File,
 }
 
-pub struct AddReservation {
+pub struct ProfileReservation {
     _file: File,
 }
 
@@ -93,12 +93,12 @@ impl StateLock {
     }
 }
 
-impl AddReservation {
+impl ProfileReservation {
     pub fn acquire(paths: &AppPaths, name: &str) -> Result<Self> {
-        ensure_private_dir(&paths.add_reservations_dir)?;
+        ensure_private_dir(&paths.profile_reservations_dir)?;
         let path = paths
-            .add_reservations_dir
-            .join(format!("{}.lock", add_reservation_key(name)));
+            .profile_reservations_dir
+            .join(format!("{}.lock", profile_reservation_key(name)));
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -129,7 +129,7 @@ fn lock_exclusive(file: &File) -> io::Result<()> {
     }
 }
 
-fn add_reservation_key(name: &str) -> String {
+fn profile_reservation_key(name: &str) -> String {
     if cfg!(target_os = "macos") {
         name.to_ascii_lowercase()
     } else {
@@ -252,9 +252,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn add_reservation_keys_serialize_names_according_to_platform() {
-        let upper = add_reservation_key("Work");
-        let lower = add_reservation_key("work");
+    fn profile_reservation_keys_serialize_names_according_to_platform() {
+        let upper = profile_reservation_key("Work");
+        let lower = profile_reservation_key("work");
         if cfg!(target_os = "macos") {
             assert_eq!(upper, "work");
             assert_eq!(upper, lower);
