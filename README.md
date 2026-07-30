@@ -5,8 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A Linux and macOS profile switcher for Claude Code. It gives Claude Code an
-isolated `CLAUDE_CONFIG_DIR` for each account and transparently forwards normal
-commands to the official Claude executable.
+isolated configuration and credential-storage directory for each account and
+transparently forwards normal commands to the official Claude executable.
 
 ```bash
 claude account add work
@@ -211,10 +211,13 @@ executable path. It never contains access or refresh tokens.
 ## macOS credential isolation
 
 Claude Code stores subscription credentials in macOS Keychain. Claude Code
-2.1.144 and later scopes its Keychain entry to `CLAUDE_CONFIG_DIR`, allowing
-each claude-account profile to keep an independent login. claude-account checks
-the Claude Code version before login, launch, and logout on macOS so an older
-global Keychain entry cannot silently select or log out the wrong account.
+2.1.144 and later supports configuration-directory-scoped Keychain entries,
+allowing each claude-account profile to keep an independent login.
+claude-account passes both `CLAUDE_CONFIG_DIR` and
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` as the same private profile directory and
+overrides inherited values for every managed Claude process. It checks the
+Claude Code version before login, launch, and logout on macOS so an older global
+Keychain entry cannot silently select or log out the wrong account.
 
 claude-account never reads, copies, or writes Keychain credential contents;
 Claude Code continues to own login, token refresh, and secure storage.
