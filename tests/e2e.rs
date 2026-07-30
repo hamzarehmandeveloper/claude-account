@@ -4,7 +4,9 @@ use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 #[cfg(target_os = "macos")]
-use std::process::Stdio;
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::process::{Child, Stdio};
 use std::process::{Command, Output};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
@@ -182,7 +184,7 @@ fn install_rejects_claude_without_profile_scoped_keychain_support() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn version_probe_times_out_and_reaps_hanging_claude() {
+fn version_probe_timeout_terminates_direct_hang() {
     let temp = tempfile::tempdir().unwrap();
     let account_home = temp.path().join("account-home");
     let fake_claude = temp.path().join("hanging-claude");
@@ -204,19 +206,68 @@ fn version_probe_times_out_and_reaps_hanging_claude() {
     .unwrap();
     fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let started = Instant::now();
-    let output = invoke(
+    let mut probe_cleanup = ProcessCleanupGuard::new(probe_pid.clone());
+    let (output, elapsed) = invoke_bounded(
         binary,
         &account_home,
         &["install", "--real", fake_claude.to_str().unwrap()],
-        &[],
+        Duration::from_secs(5),
     );
-    let elapsed = started.elapsed();
+
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("timed out querying Claude Code version"),
+        "{error}"
+    );
+    assert!(error.contains("2.1.144 or later"), "{error}");
+
+    let pid = probe_cleanup.pid();
+    assert!(
+        wait_until(Duration::from_secs(1), || !process_is_running(pid)),
+        "direct version probe process {pid} remained alive after {elapsed:?}"
+    );
+    probe_cleanup.disarm();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn version_probe_timeout_covers_inherited_pipes_and_terminates_descendant() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let fake_claude = temp.path().join("backgrounding-claude");
+    let descendant_pid = temp.path().join("descendant.pid");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+
+    fs::write(
+        &fake_claude,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               /bin/sleep 60 &\n\
+               printf '%s\\n' \"$!\" > '{}'\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            descendant_pid.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut descendant_cleanup = ProcessCleanupGuard::new(descendant_pid.clone());
+    let (output, elapsed) = invoke_bounded(
+        binary,
+        &account_home,
+        &["install", "--real", fake_claude.to_str().unwrap()],
+        Duration::from_secs(5),
+    );
 
     assert!(!output.status.success());
     assert!(
         elapsed < Duration::from_secs(5),
-        "version probe took {elapsed:?}"
+        "version probe exceeded its bounded window: {elapsed:?}"
     );
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(
@@ -225,15 +276,12 @@ fn version_probe_times_out_and_reaps_hanging_claude() {
     );
     assert!(error.contains("2.1.144 or later"), "{error}");
 
-    let pid = fs::read_to_string(&probe_pid).unwrap();
-    let still_running = Command::new("/bin/kill")
-        .args(["-0", pid.trim()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap()
-        .success();
-    assert!(!still_running, "timed-out version probe was not reaped");
+    let pid = descendant_cleanup.pid();
+    assert!(
+        wait_until(Duration::from_secs(1), || !process_is_running(pid)),
+        "version probe descendant {pid} remained alive after timeout"
+    );
+    descendant_cleanup.disarm();
 }
 
 #[cfg(target_os = "macos")]
@@ -596,6 +644,145 @@ fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(10));
     }
     predicate()
+}
+
+#[cfg(target_os = "macos")]
+fn invoke_bounded(
+    program: &Path,
+    account_home: &Path,
+    arguments: &[&str],
+    timeout: Duration,
+) -> (Output, Duration) {
+    let child = Command::new(program)
+        .env("CLAUDE_ACCOUNT_HOME", account_home)
+        .env("ANTHROPIC_API_KEY", "must-not-leak")
+        .args(arguments)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = ChildCleanupGuard::new(child);
+    let started = Instant::now();
+    let completed = loop {
+        if child.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if started.elapsed() >= timeout {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let elapsed = started.elapsed();
+
+    assert!(
+        completed,
+        "command did not terminate within {timeout:?}; cleanup guard terminated it"
+    );
+
+    (child.wait_with_output(), elapsed)
+}
+
+#[cfg(target_os = "macos")]
+struct ChildCleanupGuard {
+    child: Option<Child>,
+}
+
+#[cfg(target_os = "macos")]
+impl ChildCleanupGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.as_mut().unwrap().try_wait()
+    }
+
+    fn wait_with_output(mut self) -> Output {
+        self.child.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ChildCleanupGuard {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct ProcessCleanupGuard {
+    pid_file: PathBuf,
+    pid: Option<u32>,
+    armed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessCleanupGuard {
+    fn new(pid_file: PathBuf) -> Self {
+        Self {
+            pid_file,
+            pid: None,
+            armed: true,
+        }
+    }
+
+    fn pid(&mut self) -> u32 {
+        if let Some(pid) = self.pid {
+            return pid;
+        }
+
+        assert!(
+            wait_until(Duration::from_secs(1), || self.pid_file.exists()),
+            "process did not record its pid in {}",
+            self.pid_file.display()
+        );
+        let pid = fs::read_to_string(&self.pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        self.pid = Some(pid);
+        pid
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ProcessCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let pid = self
+            .pid
+            .or_else(|| fs::read_to_string(&self.pid_file).ok()?.trim().parse().ok());
+        if let Some(pid) = pid {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let _ = wait_until(Duration::from_secs(1), || !process_is_running(pid));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_is_running(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]

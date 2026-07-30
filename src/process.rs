@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "macos")]
-use std::process::{Output, Stdio};
+use std::process::{Child, ExitStatus, Output, Stdio};
 #[cfg(target_os = "macos")]
 use std::thread::{self, JoinHandle};
 #[cfg(target_os = "macos")]
@@ -30,6 +30,15 @@ const MINIMUM_MACOS_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 144);
 const MACOS_VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_os = "macos")]
 const VERSION_PROBE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(target_os = "macos")]
+const MACOS_ESRCH: i32 = 3;
+#[cfg(target_os = "macos")]
+const MACOS_SIGKILL: i32 = 9;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+}
 
 pub fn exec_active_profile(paths: &AppPaths, arguments: &[OsString]) -> Result<()> {
     let state = state::load(paths)?;
@@ -114,63 +123,165 @@ pub fn validate_platform_support(real_claude: &Path) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn query_claude_version(real_claude: &Path) -> Result<Output> {
+    let deadline = Instant::now() + MACOS_VERSION_PROBE_TIMEOUT;
     let mut command = command_without_auth_environment(real_claude);
     command
         .arg("--version")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command.spawn().with_context(|| {
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let child = command.spawn().with_context(|| {
         format!(
             "failed to query Claude Code version from {}",
             real_claude.display()
         )
     })?;
-    let stdout = child
+    let mut probe = VersionProbe::new(child);
+    let stdout = probe
+        .child
         .stdout
         .take()
         .context("Claude Code version probe did not capture stdout")?;
-    let stderr = child
+    let stderr = probe
+        .child
         .stderr
         .take()
         .context("Claude Code version probe did not capture stderr")?;
-    let stdout_reader = read_version_stream(stdout);
-    let stderr_reader = read_version_stream(stderr);
-    let started = Instant::now();
+    let mut stdout_reader = Some(read_version_stream(stdout));
+    let mut stderr_reader = Some(read_version_stream(stderr));
+    let mut status = None;
 
     loop {
-        if let Some(status) = child.try_wait().with_context(|| {
-            format!(
-                "failed while querying Claude Code version from {}",
-                real_claude.display()
-            )
-        })? {
-            return Ok(Output {
-                status,
-                stdout: collect_version_stream(stdout_reader, "stdout")?,
-                stderr: collect_version_stream(stderr_reader, "stderr")?,
-            });
+        if Instant::now() >= deadline {
+            return timeout_version_probe(&mut probe, real_claude);
         }
 
-        if started.elapsed() >= MACOS_VERSION_PROBE_TIMEOUT {
-            child.kill().with_context(|| {
+        if status.is_none() {
+            status = probe.try_wait().with_context(|| {
                 format!(
-                    "failed to terminate timed-out Claude Code version probe from {}",
+                    "failed while querying Claude Code version from {}",
                     real_claude.display()
                 )
             })?;
-            child.wait().with_context(|| {
-                format!(
-                    "failed to reap timed-out Claude Code version probe from {}",
-                    real_claude.display()
-                )
-            })?;
-            bail!(
-                "timed out querying Claude Code version from {}; macOS requires Claude Code 2.1.144 or later for isolated Keychain credentials",
-                real_claude.display()
-            );
         }
 
-        thread::sleep(VERSION_PROBE_POLL_INTERVAL);
+        let streams_finished = stdout_reader.as_ref().is_some_and(JoinHandle::is_finished)
+            && stderr_reader.as_ref().is_some_and(JoinHandle::is_finished);
+        if streams_finished {
+            if let Some(status) = status.take() {
+                let stdout = collect_version_stream(stdout_reader.take().unwrap(), "stdout")?;
+                let stderr = collect_version_stream(stderr_reader.take().unwrap(), "stderr")?;
+                if Instant::now() >= deadline {
+                    return timeout_version_probe(&mut probe, real_claude);
+                }
+                probe.mark_complete();
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(VERSION_PROBE_POLL_INTERVAL.min(remaining));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn timeout_version_probe(probe: &mut VersionProbe, real_claude: &Path) -> Result<Output> {
+    probe.terminate_and_reap().with_context(|| {
+        format!(
+            "timed out querying Claude Code version from {}; failed to clean up the version probe",
+            real_claude.display()
+        )
+    })?;
+    bail!(
+        "timed out querying Claude Code version from {}; macOS requires Claude Code 2.1.144 or later for isolated Keychain credentials",
+        real_claude.display()
+    )
+}
+
+#[cfg(target_os = "macos")]
+struct VersionProbe {
+    child: Child,
+    process_group: i32,
+    reaped: bool,
+    complete: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl VersionProbe {
+    fn new(child: Child) -> Self {
+        Self {
+            process_group: child.id() as i32,
+            child,
+            reaped: false,
+            complete: false,
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
+    }
+
+    fn terminate_and_reap(&mut self) -> Result<()> {
+        let terminate_result = terminate_process_group(self.process_group);
+        let reap_result = if self.reaped {
+            Ok(())
+        } else {
+            self.child.wait().map(|_| ()).map_err(anyhow::Error::from)
+        };
+        if reap_result.is_ok() {
+            self.reaped = true;
+        }
+        if terminate_result.is_ok() && reap_result.is_ok() {
+            self.complete = true;
+        }
+
+        terminate_result.context("failed to terminate Claude Code version probe process group")?;
+        reap_result.context("failed to reap Claude Code version probe")?;
+        Ok(())
+    }
+
+    fn mark_complete(&mut self) {
+        debug_assert!(self.reaped);
+        self.complete = true;
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for VersionProbe {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+
+        let _ = terminate_process_group(self.process_group);
+        if !self.reaped {
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_process_group(process_group: i32) -> io::Result<()> {
+    // A negative pid asks kill(2) to signal every process in this process group.
+    let result = unsafe { kill(-process_group, MACOS_SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(MACOS_ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
     }
 }
 
