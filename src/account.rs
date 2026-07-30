@@ -332,6 +332,18 @@ fn resolve_case_collision(paths: &AppPaths, name: &str) -> Result<()> {
 }
 
 fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> {
+    remove_with_purge(paths, name, purge, force, |path| {
+        fs::remove_dir_all(path).with_context(|| format!("failed to purge {}", path.display()))
+    })
+}
+
+fn remove_with_purge(
+    paths: &AppPaths,
+    name: &str,
+    purge: bool,
+    force: bool,
+    purge_directory: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     validate_profile_name(name)?;
     let _profile_reservation = ProfileReservation::acquire(paths, name)?;
     let (profile, real_claude, is_active) = {
@@ -389,8 +401,7 @@ fn remove(paths: &AppPaths, name: &str, purge: bool, force: bool) -> Result<()> 
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             bail!("refusing to purge a symlink or non-directory");
         }
-        fs::remove_dir_all(&expected)
-            .with_context(|| format!("failed to purge {}", expected.display()))?;
+        purge_directory(&expected)?;
         println!("Removed `{name}` and permanently deleted its local data.");
     } else {
         println!(
@@ -522,6 +533,18 @@ fn validate_profile_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use std::os::fd::AsRawFd;
+
+    #[cfg(target_os = "macos")]
+    const LOCK_EX: i32 = 2;
+    #[cfg(target_os = "macos")]
+    const LOCK_NB: i32 = 4;
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
 
     #[test]
     fn profile_name_validation_blocks_path_traversal() {
@@ -669,5 +692,73 @@ mod tests {
         let error = add(&paths, "work", None, false, false).unwrap_err();
         assert!(error.to_string().contains("differs only by letter case"));
         assert_eq!(state::load(&paths).unwrap().profiles.len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_holds_profile_reservation_during_purge() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        fs::write(
+            &fake_claude,
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let profile_dir = paths.profile_dir("Work");
+        state::ensure_private_dir(&profile_dir).unwrap();
+        fs::write(profile_dir.join("old-data"), b"remove me\n").unwrap();
+        {
+            let _lock = StateLock::acquire(&paths).unwrap();
+            let mut initial = state::load(&paths).unwrap();
+            initial.real_claude = Some(fake_claude);
+            initial
+                .profiles
+                .insert("Work".to_owned(), Profile::new(profile_dir.clone()));
+            initial.active = Some("Work".to_owned());
+            state::save(&paths, &initial).unwrap();
+        }
+
+        let reservation_path = paths.profile_reservations_dir.join("work.lock");
+        let mut observed_purge = false;
+        remove_with_purge(&paths, "Work", true, true, |purge_path| {
+            observed_purge = true;
+            assert_eq!(purge_path, profile_dir);
+            assert!(!state::load(&paths).unwrap().profiles.contains_key("Work"));
+
+            let reservation = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&reservation_path)
+                .unwrap();
+            let result = unsafe { flock(reservation.as_raw_fd(), LOCK_EX | LOCK_NB) };
+            assert_eq!(result, -1, "profile reservation was released before purge");
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                ErrorKind::WouldBlock
+            );
+
+            fs::remove_dir_all(purge_path)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(observed_purge);
+
+        let reservation = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(reservation_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { flock(reservation.as_raw_fd(), LOCK_EX | LOCK_NB) },
+            0,
+            "profile reservation remained locked after remove returned"
+        );
     }
 }
