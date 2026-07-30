@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::paths::AppPaths;
 use crate::process;
-use crate::state::{self, Profile, StateLock};
+use crate::state::{self, AddReservation, Profile, StateLock};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -100,18 +100,20 @@ impl AccountCli {
 
 fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bool) -> Result<()> {
     validate_profile_name(name)?;
+    let _add_reservation = AddReservation::acquire(paths, name)?;
     let current_executable = env::current_exe().context("failed to locate this executable")?;
-    // Hold the exclusive state lock until registration so concurrent adds cannot enter
-    // directories that alias on a case-insensitive filesystem.
-    let _state_lock = StateLock::acquire(paths)?;
-    let mut state = state::load(paths)?;
-    if state.profiles.contains_key(name) {
-        bail!("profile `{name}` already exists");
-    }
-    validate_new_profile_name(&state, name)?;
+    let initial_real_claude = {
+        let _state_lock = StateLock::acquire(paths)?;
+        let state = state::load(paths)?;
+        if state.profiles.contains_key(name) {
+            bail!("profile `{name}` already exists");
+        }
+        validate_new_profile_name(&state, name)?;
+        state.real_claude.clone()
+    };
 
     let real_claude =
-        process::resolve_real_claude(state.real_claude.as_deref(), &current_executable, paths)?;
+        process::resolve_real_claude(initial_real_claude.as_deref(), &current_executable, paths)?;
     process::validate_platform_support(&real_claude)?;
     let profile_dir = paths.profile_dir(name);
     state::ensure_private_dir(&profile_dir)?;
@@ -152,15 +154,27 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
 
     complete_claude_onboarding(&profile_dir)?;
 
-    let first_profile = state.profiles.is_empty();
-    state.real_claude = Some(real_claude);
-    state
-        .profiles
-        .insert(name.to_owned(), Profile::new(profile_dir));
-    if first_profile {
-        state.active = Some(name.to_owned());
+    let first_profile;
+    {
+        let _state_lock = StateLock::acquire(paths)?;
+        let mut state = state::load(paths)?;
+        if state.profiles.contains_key(name) {
+            bail!("profile `{name}` was added by another process");
+        }
+        validate_new_profile_name(&state, name)?;
+
+        first_profile = state.profiles.is_empty();
+        if state.real_claude == initial_real_claude {
+            state.real_claude = Some(real_claude);
+        }
+        state
+            .profiles
+            .insert(name.to_owned(), Profile::new(profile_dir));
+        if first_profile {
+            state.active = Some(name.to_owned());
+        }
+        state::save(paths, &state)?;
     }
-    state::save(paths, &state)?;
 
     if first_profile {
         println!("Added `{name}` and made it active.");

@@ -65,6 +65,10 @@ pub struct StateLock {
     _file: File,
 }
 
+pub struct AddReservation {
+    _file: File,
+}
+
 #[derive(Clone, Copy)]
 enum CaseCollisionValidation {
     Enforce,
@@ -83,18 +87,53 @@ impl StateLock {
             .open(&paths.lock_file)
             .with_context(|| format!("failed to open {}", paths.lock_file.display()))?;
 
-        loop {
-            let result = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
-            if result == 0 {
-                break;
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error).context("failed to lock profile state");
-            }
-        }
+        lock_exclusive(&file).context("failed to lock profile state")?;
 
         Ok(Self { _file: file })
+    }
+}
+
+impl AddReservation {
+    pub fn acquire(paths: &AppPaths, name: &str) -> Result<Self> {
+        ensure_private_dir(&paths.add_reservations_dir)?;
+        let path = paths
+            .add_reservations_dir
+            .join(format!("{}.lock", add_reservation_key(name)));
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect {}", path.display()))?;
+        lock_exclusive(&file)
+            .with_context(|| format!("failed to reserve profile name `{name}`"))?;
+
+        Ok(Self { _file: file })
+    }
+}
+
+fn lock_exclusive(file: &File) -> io::Result<()> {
+    loop {
+        let result = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+fn add_reservation_key(name: &str) -> String {
+    if cfg!(target_os = "macos") {
+        name.to_ascii_lowercase()
+    } else {
+        name.to_owned()
     }
 }
 
@@ -211,6 +250,19 @@ fn temporary_state_path(state_file: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_reservation_keys_serialize_names_according_to_platform() {
+        let upper = add_reservation_key("Work");
+        let lower = add_reservation_key("work");
+        if cfg!(target_os = "macos") {
+            assert_eq!(upper, "work");
+            assert_eq!(upper, lower);
+        } else {
+            assert_eq!(upper, "Work");
+            assert_ne!(upper, lower);
+        }
+    }
 
     #[test]
     fn state_round_trip_preserves_profiles() {

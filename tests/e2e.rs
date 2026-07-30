@@ -1,5 +1,11 @@
 use std::fs;
 #[cfg(target_os = "macos")]
+use std::fs::OpenOptions;
+#[cfg(target_os = "macos")]
+use std::io::ErrorKind;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -10,6 +16,16 @@ use std::process::{Child, Stdio};
 use std::process::{Command, Output};
 #[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+const LOCK_EX: i32 = 2;
+#[cfg(target_os = "macos")]
+const LOCK_NB: i32 = 4;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
 
 fn invoke(
     program: &Path,
@@ -245,7 +261,7 @@ fn version_probe_timeout_covers_inherited_pipes_and_terminates_descendant() {
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then\n\
                printf '2.1.144 (Claude Code)\\n'\n\
-               /bin/sleep 60 &\n\
+               /bin/sleep 60 2>/dev/null &\n\
                printf '%s\\n' \"$!\" > '{}'\n\
                exit 0\n\
              fi\n\
@@ -429,7 +445,12 @@ fn concurrent_case_variant_adds_start_only_one_login() {
              if [ \"$1 $2\" = \"auth login\" ]; then\n\
                printf '%s\\n' \"$CLAUDE_CONFIG_DIR\" >> '{}'\n\
                : > '{}'\n\
-               while [ ! -e '{}' ]; do sleep 0.01; done\n\
+               attempts=0\n\
+               while [ ! -e '{}' ] && [ \"$attempts\" -lt 500 ]; do\n\
+                 attempts=$((attempts + 1))\n\
+                 sleep 0.01\n\
+               done\n\
+               [ -e '{}' ] || exit 70\n\
                exit 0\n\
              fi\n\
              if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
@@ -438,6 +459,7 @@ fn concurrent_case_variant_adds_start_only_one_login() {
              exit 0\n",
             login_calls.display(),
             first_login_started.display(),
+            release_login.display(),
             release_login.display()
         ),
     )
@@ -458,10 +480,15 @@ fn concurrent_case_variant_adds_start_only_one_login() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let first = ChildCleanupGuard::new(first);
+    let mut login_release = FileReleaseGuard::new(release_login.clone());
     assert!(
         wait_until(Duration::from_secs(2), || first_login_started.exists()),
         "first add did not reach auth login"
     );
+
+    let reservation_file = account_home.join("add-reservations/work.lock");
+    assert_exclusively_locked(&reservation_file);
 
     let second = Command::new(binary)
         .env("CLAUDE_ACCOUNT_HOME", &account_home)
@@ -471,21 +498,12 @@ fn concurrent_case_variant_adds_start_only_one_login() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let second_reached_login = wait_until(Duration::from_secs(2), || {
-        fs::read_to_string(&login_calls)
-            .map(|calls| calls.lines().count() > 1)
-            .unwrap_or(false)
-    });
+    let second = ChildCleanupGuard::new(second);
 
-    fs::write(&release_login, b"release\n").unwrap();
-    let first_output = first.wait_with_output().unwrap();
-    let second_output = second.wait_with_output().unwrap();
+    login_release.release();
+    let first_output = first.wait_with_output_bounded(Duration::from_secs(3));
+    let second_output = second.wait_with_output_bounded(Duration::from_secs(3));
 
-    assert!(
-        !second_reached_login,
-        "both case-variant adds reached auth login before the first registered:\n{}",
-        fs::read_to_string(&login_calls).unwrap()
-    );
     let logged_logins = fs::read_to_string(&login_calls).unwrap();
     assert_eq!(
         logged_logins.lines().collect::<Vec<_>>(),
@@ -502,9 +520,171 @@ fn concurrent_case_variant_adds_start_only_one_login() {
         second_error.contains("differs only by letter case"),
         "{second_error}"
     );
+    assert!(
+        reservation_file.is_file(),
+        "reservation file was removed after add completed"
+    );
 
     let profiles = run(binary, &account_home, &["account", "list"]);
     assert_eq!(String::from_utf8(profiles.stdout).unwrap().trim(), "* Work");
+}
+
+#[cfg(target_os = "macos")]
+fn assert_exclusively_locked(path: &Path) {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|error| panic!("failed to open reservation {}: {error}", path.display()));
+    let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    assert_eq!(result, -1, "reservation {} was not locked", path.display());
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        ErrorKind::WouldBlock,
+        "reservation {} failed for an unexpected reason",
+        path.display()
+    );
+    assert_eq!(
+        fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn add_login_allows_unrelated_state_updates_and_merges_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let initial_claude = temp.path().join("initial-claude");
+    let replacement_claude = temp.path().join("replacement-claude");
+    let login_started = temp.path().join("login-started");
+    let release_login = temp.path().join("release-login");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+
+    fs::write(
+        &initial_claude,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2\" = \"auth login\" ]; then\n\
+               : > '{}'\n\
+               attempts=0\n\
+               while [ ! -e '{}' ] && [ \"$attempts\" -lt 500 ]; do\n\
+                 attempts=$((attempts + 1))\n\
+                 sleep 0.01\n\
+               done\n\
+               [ -e '{}' ] || exit 70\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               printf '{{\"loggedIn\":true}}\\n'\n\
+             fi\n\
+             exit 0\n",
+            login_started.display(),
+            release_login.display(),
+            release_login.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &replacement_claude,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then\n\
+           printf '2.1.144 (Claude Code)\\n'\n\
+         fi\n\
+         exit 0\n",
+    )
+    .unwrap();
+    for fake in [&initial_claude, &replacement_claude] {
+        fs::set_permissions(fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    run(
+        binary,
+        &account_home,
+        &["install", "--real", initial_claude.to_str().unwrap()],
+    );
+    let work_dir = account_home.join("profiles/work");
+    let personal_dir = account_home.join("profiles/personal");
+    fs::create_dir_all(&work_dir).unwrap();
+    fs::create_dir_all(&personal_dir).unwrap();
+    let state_file = account_home.join("state.json");
+    let mut seeded: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    seeded["active"] = serde_json::json!("work");
+    seeded["profiles"] = serde_json::json!({
+        "personal": { "config_dir": personal_dir, "created_at": 0 },
+        "work": { "config_dir": work_dir, "created_at": 0 }
+    });
+    fs::write(&state_file, serde_json::to_vec_pretty(&seeded).unwrap()).unwrap();
+
+    let add = Command::new(binary)
+        .env("CLAUDE_ACCOUNT_HOME", &account_home)
+        .env("ANTHROPIC_API_KEY", "must-not-leak")
+        .args(["account", "add", "new"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let add = ChildCleanupGuard::new(add);
+    let mut login_release = FileReleaseGuard::new(release_login);
+    assert!(
+        wait_until(Duration::from_secs(2), || login_started.exists()),
+        "add did not reach auth login"
+    );
+
+    let (use_output, _) = invoke_bounded(
+        binary,
+        &account_home,
+        &["account", "use", "personal"],
+        Duration::from_secs(2),
+    );
+    assert!(
+        use_output.status.success(),
+        "account use failed: {}",
+        String::from_utf8_lossy(&use_output.stderr)
+    );
+    let (install_output, _) = invoke_bounded(
+        binary,
+        &account_home,
+        &["install", "--real", replacement_claude.to_str().unwrap()],
+        Duration::from_secs(3),
+    );
+    assert!(
+        install_output.status.success(),
+        "concurrent install failed: {}",
+        String::from_utf8_lossy(&install_output.stderr)
+    );
+
+    login_release.release();
+    let add_output = add.wait_with_output_bounded(Duration::from_secs(3));
+    assert!(
+        add_output.status.success(),
+        "add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let final_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_file).unwrap()).unwrap();
+    assert_eq!(final_state["active"], "personal");
+    assert!(final_state["profiles"].get("work").is_some());
+    assert!(final_state["profiles"].get("personal").is_some());
+    assert!(final_state["profiles"].get("new").is_some());
+    assert_eq!(
+        final_state["real_claude"],
+        serde_json::json!(replacement_claude)
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -700,6 +880,18 @@ impl ChildCleanupGuard {
     fn wait_with_output(mut self) -> Output {
         self.child.take().unwrap().wait_with_output().unwrap()
     }
+
+    fn wait_with_output_bounded(mut self, timeout: Duration) -> Output {
+        let started = Instant::now();
+        while self.try_wait().unwrap().is_none() {
+            assert!(
+                started.elapsed() < timeout,
+                "child did not terminate within {timeout:?}; cleanup guard terminated it"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.child.take().unwrap().wait_with_output().unwrap()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -708,6 +900,36 @@ impl Drop for ChildCleanupGuard {
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct FileReleaseGuard {
+    path: PathBuf,
+    released: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl FileReleaseGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) {
+        fs::write(&self.path, b"release\n").unwrap();
+        self.released = true;
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for FileReleaseGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = fs::write(&self.path, b"release\n");
         }
     }
 }
@@ -734,18 +956,32 @@ impl ProcessCleanupGuard {
             return pid;
         }
 
-        assert!(
-            wait_until(Duration::from_secs(1), || self.pid_file.exists()),
-            "process did not record its pid in {}",
-            self.pid_file.display()
-        );
-        let pid = fs::read_to_string(&self.pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid = self
+            .wait_for_recorded_pid(Duration::from_secs(1))
+            .unwrap_or_else(|| {
+                panic!(
+                    "process did not record a valid pid in {}",
+                    self.pid_file.display()
+                )
+            });
         self.pid = Some(pid);
         pid
+    }
+
+    fn wait_for_recorded_pid(&self, timeout: Duration) -> Option<u32> {
+        let started = Instant::now();
+        loop {
+            if let Some(pid) = fs::read_to_string(&self.pid_file)
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+            {
+                return Some(pid);
+            }
+            if started.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn disarm(&mut self) {
@@ -762,7 +998,7 @@ impl Drop for ProcessCleanupGuard {
 
         let pid = self
             .pid
-            .or_else(|| fs::read_to_string(&self.pid_file).ok()?.trim().parse().ok());
+            .or_else(|| self.wait_for_recorded_pid(Duration::from_millis(250)));
         if let Some(pid) = pid {
             let _ = Command::new("/bin/kill")
                 .args(["-KILL", &pid.to_string()])
