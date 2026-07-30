@@ -1,11 +1,15 @@
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use serde::Deserialize;
+use serde_json::{Map, Value};
 
 use crate::paths::AppPaths;
 use crate::process;
@@ -129,12 +133,20 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
 
     let verification = process::managed_command(&real_claude, &profile_dir)
         .args(["auth", "status", "--json"])
-        .stdout(Stdio::null())
-        .status()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
         .context("failed to verify Claude login")?;
-    if !verification.success() {
+    if !verification.status.success() {
         bail!("Claude did not report a valid login for profile `{name}`");
     }
+    let auth_status: AuthStatus = serde_json::from_slice(&verification.stdout)
+        .context("Claude returned an invalid response from `auth status --json`")?;
+    if !auth_status.logged_in {
+        bail!("Claude did not report a valid login for profile `{name}`");
+    }
+
+    complete_claude_onboarding(&profile_dir)?;
 
     let first_profile;
     {
@@ -160,6 +172,58 @@ fn add(paths: &AppPaths, name: &str, email: Option<&str>, sso: bool, console: bo
         println!("Added `{name}`. Activate it with `claude account use {name}`.");
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthStatus {
+    #[serde(rename = "loggedIn")]
+    logged_in: bool,
+}
+
+fn complete_claude_onboarding(profile_dir: &Path) -> Result<()> {
+    let config_path = profile_dir.join(".claude.json");
+    let mut config = match fs::read(&config_path) {
+        Ok(contents) => serde_json::from_slice::<Value>(&contents)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?,
+        Err(error) if error.kind() == ErrorKind::NotFound => Value::Object(Map::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
+        }
+    };
+    let config = config
+        .as_object_mut()
+        .with_context(|| format!("{} must contain a JSON object", config_path.display()))?;
+    config.insert("hasCompletedOnboarding".to_owned(), Value::Bool(true));
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = profile_dir.join(format!(".claude.json.tmp.{}.{}", std::process::id(), nonce));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .with_context(|| format!("failed to create {}", temporary.display()))?;
+        serde_json::to_writer_pretty(&mut file, &config)
+            .context("failed to serialize Claude onboarding state")?;
+        file.write_all(b"\n")
+            .context("failed to finish Claude onboarding state")?;
+        file.sync_all()
+            .context("failed to sync Claude onboarding state")?;
+        fs::rename(&temporary, &config_path)
+            .with_context(|| format!("failed to update {}", config_path.display()))?;
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect {}", config_path.display()))?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn use_profile(paths: &AppPaths, name: &str) -> Result<()> {
@@ -375,7 +439,6 @@ fn validate_profile_name(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn profile_name_validation_blocks_path_traversal() {
@@ -396,7 +459,12 @@ mod tests {
         let mut script = fs::File::create(&fake_claude).unwrap();
         writeln!(
             script,
-            "#!/bin/sh\nprintf '%s|%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" >> '{}'\nexit 0",
+            "#!/bin/sh\n\
+             printf '%s|%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$*\" >> '{}'\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               printf '{{\"loggedIn\":true}}\\n'\n\
+             fi\n\
+             exit 0",
             log.display()
         )
         .unwrap();
@@ -415,6 +483,63 @@ mod tests {
         let expected = paths.profile_dir("work").display().to_string();
         assert!(calls.contains(&format!("{expected}|auth login")));
         assert!(calls.contains(&format!("{expected}|auth status --json")));
+        let claude_config: Value = serde_json::from_slice(
+            &fs::read(paths.profile_dir("work").join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claude_config["hasCompletedOnboarding"], true);
         assert_eq!(state::load(&paths).unwrap().active.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn onboarding_update_preserves_existing_claude_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        state::ensure_private_dir(&profile).unwrap();
+        let config_path = profile.join(".claude.json");
+        fs::write(
+            &config_path,
+            r#"{"existing":{"setting":"preserved"},"hasCompletedOnboarding":false}"#,
+        )
+        .unwrap();
+
+        complete_claude_onboarding(&profile).unwrap();
+
+        let updated: Value = serde_json::from_slice(&fs::read(&config_path).unwrap()).unwrap();
+        assert_eq!(updated["existing"]["setting"], "preserved");
+        assert_eq!(updated["hasCompletedOnboarding"], true);
+        assert_eq!(
+            fs::metadata(config_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn add_rejects_successful_command_that_reports_logged_out() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let fake_claude = temp.path().join("claude-real");
+        fs::write(
+            &fake_claude,
+            "#!/bin/sh\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               printf '{\"loggedIn\":false}\\n'\n\
+             fi\n\
+             exit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+        {
+            let _lock = StateLock::acquire(&paths).unwrap();
+            let mut initial = state::load(&paths).unwrap();
+            initial.real_claude = Some(fake_claude);
+            state::save(&paths, &initial).unwrap();
+        }
+
+        let error = add(&paths, "work", None, false, false).unwrap_err();
+        assert!(error.to_string().contains("did not report a valid login"));
+        assert!(!state::load(&paths).unwrap().profiles.contains_key("work"));
+        assert!(!paths.profile_dir("work").join(".claude.json").exists());
     }
 }

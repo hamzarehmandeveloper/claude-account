@@ -34,6 +34,10 @@ fn complete_linux_profile_lifecycle() {
         format!(
             "#!/bin/sh\n\
              printf '%s|%s|%s\\n' \"$CLAUDE_CONFIG_DIR\" \"$ANTHROPIC_API_KEY\" \"$*\" >> '{}'\n\
+             if [ \"$1 $2 $3\" = \"auth status --json\" ]; then\n\
+               printf '{{\"loggedIn\":true}}\\n'\n\
+               exit 0\n\
+             fi\n\
              if [ \"$1\" = \"auth\" ]; then exit 0; fi\n\
              printf 'forwarded:%s|config:%s\\n' \"$*\" \"$CLAUDE_CONFIG_DIR\"\n",
             calls.display()
@@ -52,6 +56,10 @@ fn complete_linux_profile_lifecycle() {
 
     let first_add = run(&shim, &account_home, &["account", "add", "work"]);
     assert!(String::from_utf8_lossy(&first_add.stdout).contains("made it active"));
+    let work_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("profiles/work/.claude.json")).unwrap())
+            .unwrap();
+    assert_eq!(work_config["hasCompletedOnboarding"], true);
 
     run(&shim, &account_home, &["account", "add", "personal"]);
 

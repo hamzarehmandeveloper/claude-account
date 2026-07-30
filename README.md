@@ -35,12 +35,12 @@ refresh. `claude-account` never reads or copies credential contents.
 
 ## Install a release
 
-Download `claude-account-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` and its
+Download `claude-account-v0.1.1-x86_64-unknown-linux-gnu.tar.gz` and its
 `.sha256` file from the [latest release][releases], then verify and install it:
 
 ```bash
-sha256sum --check claude-account-v0.1.0-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar -xzf claude-account-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sha256sum --check claude-account-v0.1.1-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar -xzf claude-account-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
 ./claude-account install
 ```
 
@@ -78,7 +78,9 @@ claude account add api-billing --console
 ```
 
 This opens Claude Code's official login flow. The first profile becomes active.
-Adding another profile does not switch the active profile.
+Adding another profile does not switch the active profile. The command also
+completes Claude Code's local onboarding state, so the next `claude` launch
+uses the saved login without asking you to authenticate again.
 
 ### Switch accounts
 
