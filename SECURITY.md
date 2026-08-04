@@ -33,6 +33,10 @@ Local profile directories are owner-only (`0700`), profile-name reservation
 directories are owner-only (`0700`), and registry and reservation files are
 owner-readable and owner-writable (`0600`).
 
+OAuth state from `claude-account-macos` is accepted for compatibility. API
+profiles from that project are rejected without reading or migrating their API
+keys because API-key management is outside this release's security boundary.
+
 The program runs with the invoking user's permissions. Anyone who can modify
 that user's configuration or executable search path is already within the same
 local trust boundary. A custom `CLAUDE_ACCOUNT_HOME` should point to a private

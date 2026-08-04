@@ -33,6 +33,20 @@ pub struct State {
 pub struct Profile {
     pub config_dir: PathBuf,
     pub created_at: u64,
+    #[serde(
+        rename = "authentication",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    imported_authentication: Option<ImportedAuthentication>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ImportedAuthentication {
+    #[serde(alias = "oauth")]
+    OAuth,
+    Api,
 }
 
 impl Profile {
@@ -44,6 +58,7 @@ impl Profile {
         Self {
             config_dir,
             created_at,
+            imported_authentication: None,
         }
     }
 }
@@ -176,6 +191,16 @@ fn validate_platform_state(
     state: &State,
     collision_validation: CaseCollisionValidation,
 ) -> Result<()> {
+    if let Some((name, _)) = state
+        .profiles
+        .iter()
+        .find(|(_, profile)| profile.imported_authentication == Some(ImportedAuthentication::Api))
+    {
+        anyhow::bail!(
+            "profile `{name}` is an API profile created by claude-account-macos; this release supports OAuth profiles only and will not read or migrate its API key; use claude-account-macos to remove that API profile or continue using it for that profile"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     {
         if matches!(collision_validation, CaseCollisionValidation::Enforce) {
@@ -283,6 +308,45 @@ mod tests {
 
         assert_eq!(loaded.active.as_deref(), Some("work"));
         assert!(loaded.profiles.contains_key("work"));
+    }
+
+    #[test]
+    fn imported_oauth_profile_remains_compatible() {
+        for authentication in ["o_auth", "oauth"] {
+            let profile: Profile = serde_json::from_value(serde_json::json!({
+                "config_dir": "/tmp/work",
+                "created_at": 0,
+                "authentication": authentication
+            }))
+            .unwrap();
+
+            assert_eq!(
+                profile.imported_authentication,
+                Some(ImportedAuthentication::OAuth)
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_imported_api_profiles_without_reading_their_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::from_roots(temp.path().join("config"), temp.path().join("data"));
+        let _lock = StateLock::acquire(&paths).unwrap();
+        fs::write(
+            &paths.state_file,
+            format!(
+                r#"{{"version":1,"profiles":{{"gateway":{{"config_dir":"{}","created_at":0,"authentication":"api"}}}}}}"#,
+                paths.profile_dir("gateway").display()
+            ),
+        )
+        .unwrap();
+
+        let error = load(&paths).unwrap_err();
+
+        assert!(error.to_string().contains("API profile"));
+        assert!(error
+            .to_string()
+            .contains("will not read or migrate its API key"));
     }
 
     #[cfg(target_os = "macos")]

@@ -31,6 +31,10 @@ cargo clippy --locked --all-targets -- -D warnings
 The automated tests use temporary directories and a fake Claude executable.
 They must not read or modify the developer's real `~/.claude` directory.
 
+Changes to macOS authentication, secure storage, profile paths, or migration
+must also be tested with two real accounts on a Mac before release. Never use
+real credentials in automated tests, logs, issues, or pull requests.
+
 ## Pull requests
 
 - Keep changes focused.

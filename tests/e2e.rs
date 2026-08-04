@@ -5,16 +5,12 @@ use std::fs::OpenOptions;
 use std::io::ErrorKind;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "macos")]
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-#[cfg(target_os = "macos")]
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
 use std::process::{Child, Stdio};
 use std::process::{Command, Output};
-#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
@@ -166,6 +162,109 @@ fn help_names_supported_platforms() {
     let help = String::from_utf8(help.stdout).unwrap();
 
     assert!(help.contains("Linux and macOS"));
+}
+
+#[test]
+fn concurrent_use_waits_for_remove_and_cannot_reactivate_deleted_profile() {
+    let temp = tempfile::tempdir().unwrap();
+    let account_home = temp.path().join("account-home");
+    let fake_claude = temp.path().join("real-claude");
+    let remove_started = temp.path().join("remove-started");
+    let release_remove = temp.path().join("release-remove");
+    let binary = Path::new(env!("CARGO_BIN_EXE_claude-account"));
+
+    fs::write(
+        &fake_claude,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then\n\
+               printf '2.1.144 (Claude Code)\\n'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1 $2\" = \"auth logout\" ]; then\n\
+               : > '{}'\n\
+               attempts=0\n\
+               while [ ! -e '{}' ] && [ \"$attempts\" -lt 500 ]; do\n\
+                 attempts=$((attempts + 1))\n\
+                 sleep 0.01\n\
+               done\n\
+               [ -e '{}' ] || exit 70\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            remove_started.display(),
+            release_remove.display(),
+            release_remove.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_claude, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let shim = account_home.join("bin/claude");
+    let work = account_home.join("profiles/work");
+    let personal = account_home.join("profiles/personal");
+    fs::create_dir_all(shim.parent().unwrap()).unwrap();
+    fs::create_dir_all(&work).unwrap();
+    fs::create_dir_all(&personal).unwrap();
+    symlink(binary, &shim).unwrap();
+    let state = serde_json::json!({
+        "version": 1,
+        "active": "personal",
+        "real_claude": fake_claude,
+        "profiles": {
+            "personal": { "config_dir": personal, "created_at": 0 },
+            "work": { "config_dir": work, "created_at": 0 }
+        }
+    });
+    fs::write(
+        account_home.join("state.json"),
+        serde_json::to_vec_pretty(&state).unwrap(),
+    )
+    .unwrap();
+
+    let removing = Command::new(&shim)
+        .env("CLAUDE_ACCOUNT_HOME", &account_home)
+        .args(["account", "remove", "work"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let removing = ChildCleanupGuard::new(removing);
+    let mut remove_release = FileReleaseGuard::new(release_remove);
+    assert!(
+        wait_until(Duration::from_secs(2), || remove_started.exists()),
+        "remove did not reach Claude logout"
+    );
+
+    let selecting = Command::new(&shim)
+        .env("CLAUDE_ACCOUNT_HOME", &account_home)
+        .args(["account", "use", "work"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut selecting = ChildCleanupGuard::new(selecting);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        selecting.try_wait().unwrap().is_none(),
+        "account use did not wait for the in-progress removal"
+    );
+
+    remove_release.release();
+    let remove_output = removing.wait_with_output_bounded(Duration::from_secs(3));
+    assert!(
+        remove_output.status.success(),
+        "remove failed: {}",
+        String::from_utf8_lossy(&remove_output.stderr)
+    );
+    let use_output = selecting.wait_with_output_bounded(Duration::from_secs(3));
+    assert!(!use_output.status.success());
+    assert!(String::from_utf8_lossy(&use_output.stderr).contains("profile `work` does not exist"));
+
+    let final_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(account_home.join("state.json")).unwrap()).unwrap();
+    assert_eq!(final_state["active"], "personal");
+    assert!(final_state["profiles"].get("work").is_none());
 }
 
 #[cfg(target_os = "macos")]
@@ -928,7 +1027,6 @@ fn resolve_case_collision_refuses_a_non_colliding_profile() {
     assert!(account_home.join("profiles/work").is_dir());
 }
 
-#[cfg(target_os = "macos")]
 fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
     let started = Instant::now();
     while started.elapsed() < timeout {
@@ -976,12 +1074,10 @@ fn invoke_bounded(
     (child.wait_with_output(), elapsed)
 }
 
-#[cfg(target_os = "macos")]
 struct ChildCleanupGuard {
     child: Option<Child>,
 }
 
-#[cfg(target_os = "macos")]
 impl ChildCleanupGuard {
     fn new(child: Child) -> Self {
         Self { child: Some(child) }
@@ -991,6 +1087,7 @@ impl ChildCleanupGuard {
         self.child.as_mut().unwrap().try_wait()
     }
 
+    #[cfg(target_os = "macos")]
     fn wait_with_output(mut self) -> Output {
         self.child.take().unwrap().wait_with_output().unwrap()
     }
@@ -1008,7 +1105,6 @@ impl ChildCleanupGuard {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for ChildCleanupGuard {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
@@ -1018,13 +1114,11 @@ impl Drop for ChildCleanupGuard {
     }
 }
 
-#[cfg(target_os = "macos")]
 struct FileReleaseGuard {
     path: PathBuf,
     released: bool,
 }
 
-#[cfg(target_os = "macos")]
 impl FileReleaseGuard {
     fn new(path: PathBuf) -> Self {
         Self {
@@ -1039,7 +1133,6 @@ impl FileReleaseGuard {
     }
 }
 
-#[cfg(target_os = "macos")]
 impl Drop for FileReleaseGuard {
     fn drop(&mut self) {
         if !self.released {

@@ -190,7 +190,7 @@ claude auth status --text
 
 ## Storage
 
-By default:
+Linux defaults:
 
 ```text
 ~/.config/claude-account/state.json
@@ -199,11 +199,29 @@ By default:
 ~/.local/share/claude-account/libexec/claude-account
 ```
 
-The standard `XDG_CONFIG_HOME` and `XDG_DATA_HOME` variables are respected.
-macOS intentionally uses the same XDG-style defaults so profiles remain
-in a consistent layout and existing state does not need migration.
-`CLAUDE_ACCOUNT_HOME` can place all application data under one absolute
-directory, which is especially useful for tests.
+macOS defaults, matching the tested `claude-account-macos` layout:
+
+```text
+~/Library/Application Support/claude-account/state.json
+~/Library/Application Support/claude-account/profiles/<name>/
+~/Library/Application Support/claude-account/bin/claude
+~/Library/Application Support/claude-account/libexec/claude-account
+```
+
+The standard `XDG_CONFIG_HOME` and `XDG_DATA_HOME` variables are respected on
+both platforms. `CLAUDE_ACCOUNT_HOME` can place all application data under one
+absolute directory, which is especially useful for tests.
+
+On macOS, an existing XDG-style installation is reused automatically when no
+Application Support state exists. If state exists in both layouts, the program
+fails closed and asks you to select one explicitly with `CLAUDE_ACCOUNT_HOME`;
+it never guesses between two account registries.
+
+Existing OAuth profiles created by
+[`Kerber0ss/claude-account-macos`](https://github.com/Kerber0ss/claude-account-macos)
+remain readable in the native Application Support layout. Its API-key profiles
+are intentionally not imported in this release: the program reports a clear
+error without reading or migrating their keys.
 
 The state file contains profile names, directory paths, and the real Claude
 executable path. It never contains access or refresh tokens.

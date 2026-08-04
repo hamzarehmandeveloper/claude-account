@@ -238,6 +238,7 @@ fn complete_claude_onboarding(profile_dir: &Path) -> Result<()> {
 
 fn use_profile(paths: &AppPaths, name: &str) -> Result<()> {
     validate_profile_name(name)?;
+    let _profile_reservation = ProfileReservation::acquire(paths, name)?;
     let _lock = StateLock::acquire(paths)?;
     let mut state = state::load(paths)?;
     if !state.profiles.contains_key(name) {
@@ -346,7 +347,7 @@ fn remove_with_purge(
 ) -> Result<()> {
     validate_profile_name(name)?;
     let _profile_reservation = ProfileReservation::acquire(paths, name)?;
-    let (profile, real_claude, is_active) = {
+    let (profile, real_claude) = {
         let _lock = StateLock::acquire(paths)?;
         let state = state::load(paths)?;
         let profile = state
@@ -364,7 +365,7 @@ fn remove_with_purge(
                 "`{name}` is active; switch profiles first, or pass --force to leave no active profile"
             );
         }
-        (profile, real_claude, is_active)
+        (profile, real_claude)
     };
 
     process::validate_platform_support(&real_claude)?;
@@ -381,7 +382,7 @@ fn remove_with_purge(
         let _lock = StateLock::acquire(paths)?;
         let mut state = state::load(paths)?;
         state.profiles.remove(name);
-        if is_active && state.active.as_deref() == Some(name) {
+        if state.active.as_deref() == Some(name) {
             state.active = None;
         }
         state::save(paths, &state)?;
