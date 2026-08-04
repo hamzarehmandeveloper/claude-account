@@ -4,9 +4,9 @@
 [![Release](https://img.shields.io/github/v/release/hamzarehmandeveloper/claude-account)](https://github.com/hamzarehmandeveloper/claude-account/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Linux and macOS profile switcher for Claude Code. It gives Claude Code an
-isolated configuration and credential-storage directory for each account and
-transparently forwards normal commands to the official Claude executable.
+A cross-platform profile switcher for Claude Code on Linux and macOS. It gives
+Claude Code an isolated configuration and credential-storage directory for each
+account and transparently forwards normal commands to the official executable.
 
 ```bash
 claude account add work

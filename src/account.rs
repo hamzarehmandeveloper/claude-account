@@ -19,7 +19,7 @@ use crate::state::{self, Profile, ProfileReservation, StateLock};
 #[command(
     name = "claude account",
     version,
-    about = "Manage isolated Claude Code accounts on Linux and macOS"
+    about = "Manage isolated Claude Code accounts across Linux and macOS"
 )]
 pub struct AccountCli {
     #[command(subcommand)]
