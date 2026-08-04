@@ -84,7 +84,7 @@ fn absolute_path(value: impl AsRef<Path>, variable: &str) -> Result<PathBuf> {
 fn platform_default_roots(home: &Path) -> Result<(PathBuf, PathBuf)> {
     #[cfg(target_os = "macos")]
     {
-        return macos_default_roots(home);
+        macos_default_roots(home)
     }
 
     #[cfg(not(target_os = "macos"))]
