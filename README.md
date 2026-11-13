@@ -4,6 +4,8 @@
 [![Release](https://img.shields.io/github/v/release/hamzarehmandeveloper/claude-account)](https://github.com/hamzarehmandeveloper/claude-account/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+[![Hacker News rank via HackerGit](https://hackergit.org/badge/hamzarehmandeveloper/claude-account.svg?style=rank&theme=dark)](https://hackergit.org/r/hamzarehmandeveloper/claude-account)
+
 A cross-platform profile switcher for Claude Code on Linux and macOS. It gives
 Claude Code an isolated configuration and credential-storage directory for each
 account and transparently forwards normal commands to the official executable.
